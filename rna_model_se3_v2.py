@@ -13,16 +13,12 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
+import torch.utils.checkpoint
 from typing import Dict, Optional, Tuple, List
-
-# Reduces CUDA allocator fragmentation on large pair tensors.
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 
 # ─────────────────────────────────────────────────────────────
@@ -271,24 +267,24 @@ class TriangleAttention(nn.Module):
         if self.mode == 'col':
             x = x.transpose(1, 2).contiguous()  # treat columns as rows
 
-        # Project: (B, L, L, D) → (B, L, L, H, Dh)
+        # Project → (B, L, L, H, Dh)
         Q = self.q(x).reshape(B, L, L, H, Dh)
         K = self.k(x).reshape(B, L, L, H, Dh)
         V = self.v(x).reshape(B, L, L, H, Dh)
         g = torch.sigmoid(self.gate(x)).reshape(B, L, L, H, Dh)
 
-        # ── Memory-efficient axial attention via F.scaled_dot_product_attention ──
-        # Fold the batch and row dims together → treat each row independently.
-        # (B, L, L, H, Dh) → (B*L, H, L, Dh)  [row=batch, col=sequence]
+        # ── Memory-efficient axial attention ────────────────────────────────
+        # Fold (B, row) together so each row is treated as an independent
+        # batch item. F.scaled_dot_product_attention uses Flash Attention
+        # when available — never materialises full (L×L) in fp32 → no OOM.
+        # (B, L, L, H, Dh) → (B*L, H, L, Dh)
         Q_ = Q.reshape(B * L, L, H, Dh).permute(0, 2, 1, 3)  # (B*L, H, L, Dh)
         K_ = K.reshape(B * L, L, H, Dh).permute(0, 2, 1, 3)
         V_ = V.reshape(B * L, L, H, Dh).permute(0, 2, 1, 3)
 
-        # F.scaled_dot_product_attention uses flash-attention when available,
-        # never materialises the full (L, L) matrix in fp32 → no OOM.
-        out_ = F.scaled_dot_product_attention(Q_, K_, V_)     # (B*L, H, L, Dh)
+        out_ = F.scaled_dot_product_attention(Q_, K_, V_)      # (B*L, H, L, Dh)
 
-        # Restore shape: (B*L, H, L, Dh) → (B, L, L, H, Dh) → gate → (B, L, L, D)
+        # Restore → gate → (B, L, L, D)
         out = out_.permute(0, 2, 1, 3).reshape(B, L, L, H, Dh)
         out = (g * out).reshape(B, L, L, D)
 
@@ -315,7 +311,7 @@ class EvoformerBlock(nn.Module):
             Linear(DP, DP * 4), nn.GELU(), Linear(DP * 4, DP))
         self.drop = nn.Dropout(cfg.DROPOUT)
 
-    def _forward_impl(self, single, pair, mask):
+    def forward(self, single, pair, mask=None):
         single = self.row_attn(single, pair, mask)
         single = single + self.drop(self.ff_s(self.norm_s(single)))
         pair   = self.pair_upd(single, pair)
@@ -323,15 +319,6 @@ class EvoformerBlock(nn.Module):
         pair   = self.tri_col(pair)
         pair   = pair + self.drop(self.ff_p(self.norm_p(pair)))
         return single, pair
-
-    def forward(self, single, pair, mask=None):
-        # Gradient checkpointing recomputes activations on backward instead of
-        # storing them → ~60% less peak VRAM at cost of extra forward compute.
-        if self.training:
-            _mask = mask if mask is not None else single.new_zeros(1)
-            return grad_checkpoint(self._forward_impl, single, pair, _mask,
-                                   use_reentrant=False)
-        return self._forward_impl(single, pair, mask)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -358,7 +345,10 @@ class InvariantPointAttention(nn.Module):
         self.pair_b = Linear(d_pair, n_head, bias=False)
         self.w_c    = nn.Parameter(torch.ones(n_head))
 
-        out_dim = n_head * (self.d_head + n_vp * 3 + 1)
+        # out_n:      H * d_head    (node attention output)
+        # out_p_flat: H * n_vp * 3 (point value vectors flattened)
+        # norm_flat:  H * n_vp     (per-head per-point norms)
+        out_dim = n_head * (self.d_head + n_vp * 3 + n_vp)
         self.out_proj = nn.Sequential(
             Linear(out_dim, d_node, init='final'),
         )
@@ -474,18 +464,12 @@ class StructureBlock(nn.Module):
         )
         self.drop = nn.Dropout(cfg.DROPOUT)
 
-    def _forward_impl(self, single, pair, T):
-        single = self.drop(self.ipa(single, pair, T))
-        single = self.norm1(single)
+    def forward(self, single, pair, T):
+        # IPA returns single + attention_output (residual connection inside IPA)
+        single = self.norm1(self.drop(self.ipa(single, pair, T)))
         T      = self.bb(single, T)
         single = single + self.drop(self.ff(self.norm2(single)))
         return single, T
-
-    def forward(self, single, pair, T):
-        if self.training:
-            return grad_checkpoint(self._forward_impl, single, pair, T,
-                                   use_reentrant=False)
-        return self._forward_impl(single, pair, T)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -600,6 +584,8 @@ class RNAFoldSE3(nn.Module):
             single = single + self.recycle_single(prev_single)
             pair   = pair   + self.recycle_pair(prev_pair)
 
+            # Gradient checkpointing on evoformer blocks saves ~4×(B,L,L,D_PAIR)
+            # activations during training — trades compute for memory.
             for block in self.evoformer:
                 if self.training:
                     single, pair = torch.utils.checkpoint.checkpoint(
@@ -609,7 +595,11 @@ class RNAFoldSE3(nn.Module):
 
             s = single
             for block in self.structure:
-                s, T = block(s, pair, T)
+                if self.training:
+                    s, T = torch.utils.checkpoint.checkpoint(
+                        block, s, pair, T, use_reentrant=False)
+                else:
+                    s, T = block(s, pair, T)
 
             prev_single = single.detach()
             prev_pair   = pair.detach()
