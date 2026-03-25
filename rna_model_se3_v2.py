@@ -272,27 +272,29 @@ class TriangleAttention(nn.Module):
         g = torch.sigmoid(self.gate(x)).reshape(B, L, L, H, Dh).permute(0, 1, 3, 2, 4)
 
         # ── Chunked row attention ──────────────────────────────────────────
-        # Original einsum 'bihkd,bihjd->bihkj' materialises (B,L,H,L,L) =
-        # 2×512×4×512×512 × 2 bytes ≈ 1 GB → OOM on 16 GB P100.
-        # Process CHUNK_ROWS rows of the outer L at a time; peak per chunk is
-        # (B,CHUNK,H,L,Dh) for Q_c and (B,CHUNK,H,L) for attn_c — ~16 MB each.
+        # Q/K/V shape: (B, L, H, L, Dh)  — dim1=row i, dim3=col j
+        # For each row i: Q_i (B,H,L,Dh) attends over K_i (B,H,L,Dh).
+        # Materialising full (B,L,H,L,L) would be ~1 GB at L=512 → OOM.
+        # Process CHUNK_ROWS rows at a time instead.
         CHUNK_ROWS = 64   # reduce to 32 if still OOM
-        K_flat = K.reshape(B, L, H, Dh)  # (B,L,H,Dh)
-        V_flat = V.reshape(B, L, H, Dh)
         out_chunks = []
         for i0 in range(0, L, CHUNK_ROWS):
-            i1   = min(i0 + CHUNK_ROWS, L)
-            C    = i1 - i0
-            Q_c  = Q[:, i0:i1].reshape(B, C, H, Dh)   # (B,C,H,Dh)
-            # attn_c: (B,C,H,L)
-            attn_c = torch.einsum('bchd,bihd->bchi', Q_c, K_flat) * self.scale
-            attn_c = F.softmax(attn_c, dim=-1)
-            # out_c: (B,C,H,Dh)
-            out_c  = torch.einsum('bchi,bihd->bchd', attn_c, V_flat)
-            out_chunks.append(out_c)                   # accumulate on CPU would save more, but GPU is fine for C=64
+            i1  = min(i0 + CHUNK_ROWS, L)
+            C   = i1 - i0
+            # Q_c: (B, C, H, L, Dh)  — chunk of rows, full column span
+            Q_c = Q[:, i0:i1]                          # (B,C,H,L,Dh)
+            K_c = K[:, i0:i1]                          # (B,C,H,L,Dh)
+            V_c = V[:, i0:i1]                          # (B,C,H,L,Dh)
+            # attn_c: (B,C,H,L,L)  — Q col-k vs K col-j for each chunk row
+            attn_c = torch.einsum('bchkd,bchjd->bchkj', Q_c, K_c) * self.scale
+            attn_c = F.softmax(attn_c, dim=-1)         # (B,C,H,L,L)
+            # out_c: (B,C,H,L,Dh)
+            out_c  = torch.einsum('bchkj,bchjd->bchkd', attn_c, V_c)
+            out_chunks.append(out_c)                   # keep on GPU
 
-        out = torch.cat(out_chunks, dim=1)             # (B,L,H,Dh)
-        out = (g.reshape(B, L, H, Dh) * out).reshape(B, L, L, D)
+        # out: (B,L,H,L,Dh) → gate → (B,L,L,D)
+        out = torch.cat(out_chunks, dim=1)             # (B,L,H,L,Dh)
+        out = (g * out).permute(0, 1, 3, 2, 4).reshape(B, L, L, D)
 
         if self.mode == 'col':
             out = out.transpose(1, 2).contiguous()
