@@ -422,9 +422,16 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
     model.train()
     total, n = 0.0, 0
     agg = {k: 0.0 for k in ['mse','tm','fape','dist','contact','recycle']}
+    n_batches = len(loader)
 
-    bar = tqdm(loader, desc=f"Epoch {epoch:02d}", leave=False)
-    for batch in bar:
+    bar = tqdm(
+        loader,
+        desc=f"  Epoch {epoch:02d} [train]",
+        leave=True,
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+    )
+    for step, batch in enumerate(bar, 1):
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=cfg.MIXED_PREC):
@@ -434,12 +441,12 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
         if cfg.MIXED_PREC:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
             optimizer.step()
 
         scheduler.step()
@@ -448,7 +455,17 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
         n     += 1
         for k in agg:
             agg[k] += parts[k]
-        bar.set_postfix(loss=f"{total/n:.4f}", tm=f"{agg['tm']/n:.3f}")
+
+        lr_now = scheduler.get_last_lr()[0]
+        bar.set_postfix(
+            loss   = f"{total/n:.4f}",
+            mse    = f"{agg['mse']/n:.3f}",
+            tm     = f"{agg['tm']/n:.3f}",
+            fape   = f"{agg['fape']/n:.3f}",
+            gnorm  = f"{float(grad_norm):.2f}",
+            lr     = f"{lr_now:.1e}",
+            step   = f"{step}/{n_batches}",
+        )
 
     return total / n, {k: v / n for k, v in agg.items()}
 
@@ -457,12 +474,16 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
 def eval_epoch(model, loader, device):
     model.eval()
     total, n = 0.0, 0
-    for batch in tqdm(loader, desc="  Val", leave=False):
+    bar = tqdm(loader, desc="  Epoch -- [val  ]", leave=True,
+               dynamic_ncols=True,
+               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]{postfix}")
+    for batch in bar:
         with autocast(enabled=cfg.MIXED_PREC):
             outputs = model(batch, device=device)
             loss, _ = multi_task_loss(outputs, batch, device)
         total += loss.item()
         n     += 1
+        bar.set_postfix(val_loss=f"{total/n:.4f}")
     return total / n
 
 
@@ -542,22 +563,30 @@ def run_training(
     history   = []
     ckpt_path = os.path.join(cfg.OUT_DIR, 'best_rna_se3_v2.pt')
 
-    print(f"\n  {'─'*60}")
-    print(f"  Starting training for {epochs} epochs")
-    print(f"  {'─'*60}")
+    print(f"\n  {'─'*70}")
+    print(f"  Starting training for {epochs} epochs  |  {len(train_loader)} steps/epoch")
+    print(f"  {'─'*70}\n")
 
     for epoch in range(1, epochs + 1):
+        print(f"\n{'━'*70}")
+        print(f"  EPOCH {epoch}/{epochs}")
+        print(f"{'━'*70}")
+
         train_loss, parts = train_epoch(
             model, train_loader, optimizer, scheduler, scaler, epoch, device)
+
+        # Update val bar description to show current epoch
+        val_bar_desc = f"  Epoch {epoch:02d} [val  ]"
         val_loss = eval_epoch(model, valid_loader, device)
 
         lrs = scheduler.get_last_lr()
         print(
-            f"  Ep {epoch:3d}/{epochs} | "
-            f"train={train_loss:.4f} "
-            f"(mse={parts['mse']:.3f} tm={parts['tm']:.3f} "
-            f"fape={parts['fape']:.3f} dist={parts['dist']:.3f}) | "
-            f"val={val_loss:.4f} | lr={lrs[0]:.2e}"
+            f"\n  ┌─ Epoch {epoch:3d}/{epochs} Summary {'─'*38}\n"
+            f"  │  Train loss : {train_loss:.5f}   Val loss : {val_loss:.5f}\n"
+            f"  │  ├ mse={parts['mse']:.4f}  tm={parts['tm']:.4f}  fape={parts['fape']:.4f}\n"
+            f"  │  └ dist={parts['dist']:.4f}  contact={parts['contact']:.4f}  recycle={parts['recycle']:.4f}\n"
+            f"  │  LR (pair/other): {lrs[0]:.2e} / {lrs[-1]:.2e}\n"
+            f"  └{'─'*56}"
         )
 
         history.append({'epoch': epoch, 'train': train_loss, 'val': val_loss, **parts})
