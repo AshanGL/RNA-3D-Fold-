@@ -76,7 +76,10 @@ class TrainConfig:
 
     # ── MISC ─────────────────────────────────────────────────
     SEED         = 42
-    NUM_WORKERS  = 2
+    # NUM_WORKERS must be 0 on Kaggle/multi-GPU: forked workers inherit the
+    # parent CUDA context and crash with cudaErrorInitializationError.
+    # Main-process loading is safe and only ~10-15% slower.
+    NUM_WORKERS  = 0
 
 cfg = TrainConfig()
 
@@ -513,11 +516,12 @@ def run_training(
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=cfg.NUM_WORKERS,
-        pin_memory=True, drop_last=True,
+        pin_memory=(cfg.NUM_WORKERS > 0), drop_last=True,
     )
     valid_loader = DataLoader(
         valid_ds, batch_size=batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=cfg.NUM_WORKERS,
+        pin_memory=(cfg.NUM_WORKERS > 0),
     )
 
     # ── Optimizer ──
