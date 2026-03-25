@@ -25,19 +25,23 @@ from typing import Dict, Optional, Tuple, List
 # ─────────────────────────────────────────────────────────────
 class ModelConfig:
     # Sequence / pair dims
-    D_NODE   = 256
-    D_PAIR   = 128
-    D_HIDDEN = 128
+    # D_PAIR 128→64: pair tensor is (B,L,L,D_PAIR) — halving cuts pair memory 4×.
+    # D_NODE 256→128: cuts single-rep and IPA memory in half.
+    D_NODE   = 128
+    D_PAIR   = 64
+    D_HIDDEN = 64
 
-    # Attention
-    N_HEAD      = 8
+    # Attention — keep n_head divisible into D_NODE and D_PAIR
+    N_HEAD      = 4   # was 8
     N_QUERY_PT  = 4
-    N_VALUE_PT  = 8
+    N_VALUE_PT  = 4   # was 8
 
     # Layers
-    N_EVOFORMER = 8
-    N_STRUCTURE = 4
-    N_RECYCLE   = 3
+    # N_EVOFORMER 8→4: each block stores (B,L,L,D_PAIR) for backward; fewer = less peak RAM.
+    # N_RECYCLE   3→2: each recycle reruns the full stack.
+    N_EVOFORMER = 4
+    N_STRUCTURE = 3
+    N_RECYCLE   = 2
 
     # Input feature dims (must match rna_features_v2.py)
     N_DIST_BINS = 36
@@ -260,22 +264,41 @@ class TriangleAttention(nn.Module):
 
         x = self.norm(pair)
         if self.mode == 'col':
-            x = x.transpose(1, 2)  # treat columns as rows
+            x = x.transpose(1, 2).contiguous()  # treat columns as rows
 
-        Q = self.q(x).reshape(B, L, L, H, Dh).permute(0, 1, 3, 2, 4)   # (B,L,H,L,Dh)
+        Q = self.q(x).reshape(B, L, L, H, Dh).permute(0, 1, 3, 2, 4)  # (B,L,H,L,Dh)
         K = self.k(x).reshape(B, L, L, H, Dh).permute(0, 1, 3, 2, 4)
         V = self.v(x).reshape(B, L, L, H, Dh).permute(0, 1, 3, 2, 4)
         g = torch.sigmoid(self.gate(x)).reshape(B, L, L, H, Dh).permute(0, 1, 3, 2, 4)
 
-        attn = torch.einsum('bihkd,bihjd->bihkj', Q, K) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out  = torch.einsum('bihkj,bihjd->bihkd', attn, V)
-        out  = (g * out).permute(0, 1, 3, 2, 4).reshape(B, L, L, D)
+        # ── Chunked row attention ──────────────────────────────────────────
+        # Original einsum 'bihkd,bihjd->bihkj' materialises (B,L,H,L,L) =
+        # 2×512×4×512×512 × 2 bytes ≈ 1 GB → OOM on 16 GB P100.
+        # Process CHUNK_ROWS rows of the outer L at a time; peak per chunk is
+        # (B,CHUNK,H,L,Dh) for Q_c and (B,CHUNK,H,L) for attn_c — ~16 MB each.
+        CHUNK_ROWS = 64   # reduce to 32 if still OOM
+        K_flat = K.reshape(B, L, H, Dh)  # (B,L,H,Dh)
+        V_flat = V.reshape(B, L, H, Dh)
+        out_chunks = []
+        for i0 in range(0, L, CHUNK_ROWS):
+            i1   = min(i0 + CHUNK_ROWS, L)
+            C    = i1 - i0
+            Q_c  = Q[:, i0:i1].reshape(B, C, H, Dh)   # (B,C,H,Dh)
+            # attn_c: (B,C,H,L)
+            attn_c = torch.einsum('bchd,bihd->bchi', Q_c, K_flat) * self.scale
+            attn_c = F.softmax(attn_c, dim=-1)
+            # out_c: (B,C,H,Dh)
+            out_c  = torch.einsum('bchi,bihd->bchd', attn_c, V_flat)
+            out_chunks.append(out_c)                   # accumulate on CPU would save more, but GPU is fine for C=64
+
+        out = torch.cat(out_chunks, dim=1)             # (B,L,H,Dh)
+        out = (g.reshape(B, L, H, Dh) * out).reshape(B, L, L, D)
 
         if self.mode == 'col':
-            out = out.transpose(1, 2)
+            out = out.transpose(1, 2).contiguous()
 
         return pair + self.out(out)
+
 
 
 class EvoformerBlock(nn.Module):
