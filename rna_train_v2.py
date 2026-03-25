@@ -258,7 +258,7 @@ class RNADataset(Dataset):
             # ── inputs ──
             'seq_ids'    : seq_ids,
             'seq_mask'   : seq_mask,
-            'f1'         : torch.from_numpy(feats['f1'][:L]),
+            'f1'         : torch.from_numpy(feats['f1']),
             'dihed'      : torch.from_numpy(feats['dihed']),
             'ss_pair'    : torch.from_numpy(feats['ss_pair']),
             'dist_rbf'   : torch.from_numpy(feats['dist_rbf']),
