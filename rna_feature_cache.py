@@ -397,6 +397,11 @@ def _pair_freq_vectorized(msa, weights, A=5, pseudo=0.5):
     """
     Fully vectorized replacement for the original 4-level nested loop.
     Builds (L, L, A, A) pair frequencies using einsum.
+
+    Fix: removed the erroneous .transpose(1,0,2) calls that swapped the N and
+    chunk/L dimensions, causing numpy to mis-identify the contracted axis 'n'.
+    Also switched to optimize=False to prevent numpy from caching a contraction
+    path that is invalidated when N changes between MSA files (e.g. 512 → 64).
     """
     N, L = msa.shape
     Neff = weights.sum()
@@ -408,18 +413,20 @@ def _pair_freq_vectorized(msa, weights, A=5, pseudo=0.5):
     # weighted one-hot  (N, L, A)
     woh = oh * weights[:, None, None]
 
-    # f2[i,j,a,b] = sum_n w_n * oh[n,i,a] * oh[n,j,b]
-    # = einsum('nia,njb->ijab', woh, oh)
-    # Split into chunks to avoid L² × A² × N memory explosion for long seqs
+    # f2[i,j,a,b] = sum_n woh[n,i,a] * oh[n,j,b]
+    # woh[:, i0:i1, :] shape: (N, chunk, A) — axes n, i, a
+    # oh              shape: (N, L,     A) — axes n, j, b
+    # einsum contracts over n (sequences), outer-products over a and b.
+    # optimize=False: avoid numpy reusing a cached path whose size assumptions
+    # break when a subsequent MSA has a different number of sequences (N).
     CHUNK = 64
     f2 = np.zeros((L, L, A, A), np.float32)
     for i0 in range(0, L, CHUNK):
         i1 = min(i0 + CHUNK, L)
-        # (chunk, N, A) × (L, N, A) → einsum → (chunk, L, A, A)
         f2[i0:i1] = np.einsum('nia,njb->ijab',
-                               woh[:, i0:i1, :].transpose(1, 0, 2),
-                               oh.transpose(1, 0, 2),
-                               optimize=True)
+                               woh[:, i0:i1, :],
+                               oh,
+                               optimize=False)
     f2 /= (Neff + 1e-8)
     return (1 - pseudo) * f2 + pseudo / (A * A)
 
