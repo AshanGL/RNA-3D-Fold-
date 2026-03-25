@@ -614,8 +614,12 @@ def build_all_features(
     seq_t = seq[:L]
 
     # ── MSA covariation ──────────────────────────────────────
+    # IMPORTANT: pass max_len (512), NOT L (actual seq len).
+    # msa_covariation_features pads/crops to the given seq_len, so if we
+    # pass L the returned MIp/FNp/f1 will be (L_seq, ...) — variable across
+    # samples — and torch.stack in collate_fn will crash with a size mismatch.
     msa_path = find_msa_file(msa_dir, target_id)
-    cov      = msa_covariation_features(msa_path, L, max_seqs=512)
+    cov      = msa_covariation_features(msa_path, max_len, max_seqs=512)
 
     # ── Secondary structure (sequence-only) ──────────────────
     ss = secondary_structure_features(seq_t, max_len)
