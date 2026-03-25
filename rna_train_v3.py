@@ -333,6 +333,12 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
     agg = {k: 0.0 for k in ['mse','tm','fape','dist','contact','recycle']}
     n_batches = len(loader)
 
+    # Print a metrics header once per epoch so Kaggle's truncated tqdm still
+    # shows progress even if the postfix gets cut off.
+    print(f"  {'step':>6}  {'loss':>8}  {'mse':>7}  {'tm':>7}  "
+          f"{'fape':>7}  {'gnorm':>7}  {'lr':>9}")
+    print(f"  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*9}")
+
     bar = tqdm(
         loader,
         desc=f"  Epoch {epoch:02d} [train]",
@@ -340,6 +346,9 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
         dynamic_ncols=True,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
     )
+    # Print every ~10% of steps (at least every 10 steps, at most every 50)
+    log_every = max(1, min(50, n_batches // 10))
+
     for step, batch in enumerate(bar, 1):
         optimizer.zero_grad(set_to_none=True)
 
@@ -365,16 +374,27 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
         for k in agg:
             agg[k] += parts[k]
 
-        lr_now = scheduler.get_last_lr()[0]
+        lr_now   = scheduler.get_last_lr()[0]
+        avg_loss = total / n
+        avg_mse  = agg['mse'] / n
+        avg_tm   = agg['tm'] / n
+        avg_fape = agg['fape'] / n
+
         bar.set_postfix(
-            loss  = f"{total/n:.4f}",
-            mse   = f"{agg['mse']/n:.3f}",
-            tm    = f"{agg['tm']/n:.3f}",
-            fape  = f"{agg['fape']/n:.3f}",
+            loss  = f"{avg_loss:.4f}",
+            mse   = f"{avg_mse:.3f}",
+            tm    = f"{avg_tm:.3f}",
+            fape  = f"{avg_fape:.3f}",
             gnorm = f"{float(grad_norm):.2f}",
             lr    = f"{lr_now:.1e}",
             step  = f"{step}/{n_batches}",
         )
+
+        # Plain print fallback — always visible in Kaggle notebook cell output
+        if step % log_every == 0 or step == n_batches:
+            print(f"  {step:>6}/{n_batches:<6}  {avg_loss:>8.4f}  "
+                  f"{avg_mse:>7.4f}  {avg_tm:>7.4f}  "
+                  f"{avg_fape:>7.4f}  {float(grad_norm):>7.3f}  {lr_now:>9.2e}")
 
     return total / n, {k: v / n for k, v in agg.items()}
 
@@ -383,7 +403,7 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, device):
 def eval_epoch(model, loader, device):
     model.eval()
     total, n = 0.0, 0
-    bar = tqdm(loader, desc="  Epoch -- [val  ]", leave=True,
+    bar = tqdm(loader, desc="  Validation", leave=True,
                dynamic_ncols=True,
                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]{postfix}")
     for batch in bar:
@@ -393,7 +413,9 @@ def eval_epoch(model, loader, device):
         total += loss.item()
         n     += 1
         bar.set_postfix(val_loss=f"{total/n:.4f}")
-    return total / n
+    val_loss = total / n
+    print(f"  Val loss: {val_loss:.5f}")
+    return val_loss
 
 
 # ─────────────────────────────────────────────────────────────
@@ -426,7 +448,7 @@ def run_training(
     model, device = build_model_dual_gpu()
     n_gpus   = torch.cuda.device_count()
     eff_batch = batch_size * max(n_gpus, 1)
-    print(f"  🔥  Using {max(n_gpus,1)} GPU(s) via DataParallel")
+    # Note: build_model_dual_gpu() already prints the GPU info line
     print(f"  Effective batch size: {eff_batch}  ({batch_size} × {max(n_gpus,1)} GPU)")
 
     # ── Load CSVs ──
