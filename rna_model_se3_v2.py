@@ -213,7 +213,8 @@ class RowAttentionWithPairBias(nn.Module):
         bias = self.pair_bias(pair).permute(0, 3, 1, 2)
         attn = attn + bias
         if mask is not None:
-            attn = attn.masked_fill(~mask[:, None, None, :], -1e9)
+            attn = attn.masked_fill(~mask[:, None, None, :],
+                                    torch.finfo(attn.dtype).min / 2)
         attn = F.softmax(attn, dim=-1)
         out  = torch.einsum('bhij,bhjd->bhid', attn, V)
         out  = (g * out).permute(0, 2, 1, 3).reshape(B, L, D)
