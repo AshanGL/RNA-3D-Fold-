@@ -219,12 +219,14 @@ class RNADataset(Dataset):
                 aligned = align_coords(seq, cif_seq, cif_coords, L)
                 # aligned may be shorter than L if the CIF has fewer residues;
                 # build a full-length valid mask so boolean indexing never mismatches
-                L_aln   = len(aligned)
-                valid_aln = ~np.isnan(aligned[:, 0])          # shape (L_aln,)
-                valid   = np.zeros(L, dtype=bool)              # shape (L,)
-                valid[:L_aln] = valid_aln
-                coords_gt[:L_aln][valid_aln]  = aligned[valid_aln]
-                coord_mask[valid] = 1.0
+                L_aln     = len(aligned)
+                valid_aln = ~np.isnan(aligned[:, 0])   # shape (L_aln,)
+                abs_idx   = np.where(valid_aln)[0]     # integer positions in aligned
+                coords_gt[abs_idx]  = aligned[abs_idx] # single-step index — true in-place
+                coord_mask[abs_idx] = 1.0
+                # full-length bool mask for the contact loop below
+                valid = np.zeros(L, dtype=bool)
+                valid[abs_idx] = True
                 dist_bins_t       = coords_to_dist_bins(aligned, L)
                 # contact target (< 8 Å)
                 dist_full = np.zeros((L, L), np.float32)
