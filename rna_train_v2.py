@@ -217,8 +217,13 @@ class RNADataset(Dataset):
             if result is not None:
                 cif_seq, cif_coords = result
                 aligned = align_coords(seq, cif_seq, cif_coords, L)
-                valid   = ~np.isnan(aligned[:, 0])
-                coords_gt[valid]  = aligned[valid]
+                # aligned may be shorter than L if the CIF has fewer residues;
+                # build a full-length valid mask so boolean indexing never mismatches
+                L_aln   = len(aligned)
+                valid_aln = ~np.isnan(aligned[:, 0])          # shape (L_aln,)
+                valid   = np.zeros(L, dtype=bool)              # shape (L,)
+                valid[:L_aln] = valid_aln
+                coords_gt[:L_aln][valid_aln]  = aligned[valid_aln]
                 coord_mask[valid] = 1.0
                 dist_bins_t       = coords_to_dist_bins(aligned, L)
                 # contact target (< 8 Å)
