@@ -177,14 +177,26 @@ class PairEmbedding(nn.Module):
     def forward(self, rbf, dist_bins, orient, rel_pos,
                 MIp, FNp, contact_ss, pair_type):
         cov = torch.stack([MIp, FNp], dim=-1)        # (B, L, L, 2)
+
+        # dist_bins from the cache is (B, L, L) int64 bin indices.
+        # One-hot encode → (B, L, L, N_DIST_BINS) so shapes align for cat.
+        # If it already has 4 dims (e.g. the quick-test stub) pass it through.
+        if dist_bins.dim() == 3:
+            dist_bins_oh = F.one_hot(
+                dist_bins.long().clamp(0, cfg.N_DIST_BINS - 1),
+                num_classes=cfg.N_DIST_BINS,
+            ).float()                                # (B, L, L, 36)
+        else:
+            dist_bins_oh = dist_bins.float()         # already (B, L, L, 36)
+
         x   = torch.cat([
-            rbf,          # (B, L, L, 16) — zeros at inference
-            dist_bins,    # (B, L, L, 36)
-            orient,       # (B, L, L, 4)
-            rel_pos,      # (B, L, L, 65)
-            cov,          # (B, L, L, 2)
-            contact_ss.unsqueeze(-1),   # (B, L, L, 1)
-            pair_type,    # (B, L, L, 3)
+            rbf,                          # (B, L, L, 16) — zeros at inference
+            dist_bins_oh,                 # (B, L, L, 36)
+            orient,                       # (B, L, L,  4)
+            rel_pos,                      # (B, L, L, 65)
+            cov,                          # (B, L, L,  2)
+            contact_ss.unsqueeze(-1),     # (B, L, L,  1)
+            pair_type,                    # (B, L, L,  3)
         ], dim=-1)        # total: 127
         return self.proj(x)     # (B, L, L, D_PAIR)
 
